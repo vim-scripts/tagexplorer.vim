@@ -1,7 +1,7 @@
 " File: tagexplorer.vim
 " Author: Yegappan Lakshmanan (yegappan AT yahoo DOT com)
-" Version: 1.1
-" Last Modified: Nov 15, 2002
+" Version: 1.2
+" Last Modified: Dec 26, 2002
 "
 " Overview
 " --------
@@ -91,6 +91,9 @@
 "
 " You can display the prototype of a tag by pressing <Spacebar> key when
 " the cursor is placed over a tag name.
+"
+" You can update the tags listed for a file by pressing the 'u' key in the tag
+" explorer window.
 "
 " You can open a different directory by using the 'g' command. You will be
 " prompted to enter the name of the directory. You can recall the previously
@@ -285,44 +288,251 @@ if !exists('TE_Exclude_Dir_Pattern')
     let TE_Exclude_Dir_Pattern = ''
 endif
 
+" Script local variable to keep track of the tag explorer state information
 let s:current_dirname = ''
 let s:te_file_cnt = 0
 let s:comments = 3
 let s:te_winsize_chgd = 0
 
-" TE_ToggleWindow()
-" Open/Close the tag explorer window
-function! s:TE_ToggleWindow()
-    " Tag explorer buffer name
+" TE_DeleteStateInfo()
+" Delete all variables created for a directory
+function! s:TE_DeleteStateInfo()
+    while s:te_file_cnt != 0
+        " For every file listed for the directory, remove all the variables
+        " associated with the file
+        unlet! b:te_{s:te_file_cnt}_name
+        unlet! b:te_{s:te_file_cnt}_start
+        unlet! b:te_{s:te_file_cnt}_end
+
+        " Remove all the variables associated with the different tag types
+        " displayed for the file
+        let var = 'b:te_' . s:te_file_cnt . '_ttype_cnt'
+        if exists(var)
+            let i = 1
+            while i <= b:te_{s:te_file_cnt}_ttype_cnt
+                let ttype = b:te_{s:te_file_cnt}_{i}_name
+                let j = 1
+                " Remove all the tags of this type
+                while j <= b:te_{s:te_file_cnt}_{ttype}_cnt
+                    unlet! b:te_{s:te_file_cnt}_{ttype}_{j}_tag
+                    let j = j + 1
+                endwhile
+
+                unlet! b:te_{s:te_file_cnt}_{ttype}_tagnames
+                unlet! b:te_{s:te_file_cnt}_{ttype}_cnt
+                unlet! b:te_{s:te_file_cnt}_{i}_name
+                unlet! b:te_{s:te_file_cnt}_{i}_start
+                unlet! b:te_{s:te_file_cnt}_{i}_end
+                let i = i + 1
+            endwhile
+            unlet! b:te_{s:te_file_cnt}_ttype_cnt
+        endif
+        let s:te_file_cnt = s:te_file_cnt - 1
+    endwhile
+endfunction
+
+" TE_OpenWindow()
+" Create a new tag explorer window. If the window is already present, jump to
+" the window
+function! s:TE_OpenWindow()
+    " Tag explorer window name
     let bname = '__Tag_Explorer__'
 
-    " If tag explorer window is open then close it.
+    " If the window is already present, jump to the window
     let winnum = bufwinnr(bname)
     if winnum != -1
-        if winnr() == winnum
-            " Already in the tag explorer window. Close it and return
-            close
-        else
-            " Goto the tag explorer window, close it and then come back to the
-            " original window
-            let curbufnr = bufnr('%')
+        " Jump to the existing window
+        if winnr() != winnum
             exe winnum . 'wincmd w'
-            close
-            " Need to jump back to the original window only if we are not
-            " already in that window
-            let winnum = bufwinnr(curbufnr)
-            if winnr() != winnum
-                exe winnum . 'wincmd w'
-            endif
         endif
         return
     endif
 
-    " Mark the current window as the file window
-    let w:te_file_window = "yes"
+    " Create a new window. If user prefers a horizontal window, then open
+    " a horizontally split window. Otherwise open a vertically split
+    " window
+    if g:TE_Use_Horiz_Window == 1
+        " If a single window is used for all files, then open the tag
+        " explorer window at the very bottom
+        let win_dir = 'botright'
+        " Default horizontal window height is 10
+        let win_width = 10
+    else
+        " Increase the window size, if needed, to accomodate the new
+        " window
+        if g:TE_Adjust_Winwidth == 1 && &columns < (80 + g:TE_WinWidth)
+            " one extra column is needed to include the vertical split
+            let &columns= &columns + (g:TE_WinWidth + 1)
+            let s:te_winsize_chgd = 1
+        else
+            let s:te_winsize_chgd = 0
+        endif
 
-    " List the files in the current directory
-    call s:TE_ListDir(".")
+        " Open the window at the leftmost place
+        if g:TE_Use_Right_Window == 1
+            let win_dir = 'botright vertical'
+        else
+            let win_dir = 'topleft vertical'
+        endif
+        let win_width = g:TE_WinWidth
+    endif
+
+    " If the tag explorer temporary buffer already exists, then reuse it.
+    " Otherwise create a new buffer
+    let bufnum = bufnr(bname)
+    if bufnum == -1
+        " Create a new buffer
+        let wcmd = bname
+    else
+        " Edit the existing buffer
+        let wcmd = '+buffer' . bufnum
+    endif
+
+    " Create the tag explorer window
+    exe 'silent! ' . win_dir . ' ' . win_width . 'split ' . wcmd
+
+    " Mark the buffer as a scratch buffer
+    setlocal buftype=nofile
+    setlocal bufhidden=delete
+    setlocal noswapfile
+    setlocal nowrap
+    setlocal nobuflisted
+    setlocal nonumber
+
+    " Create buffer local mappings for the tag explorer window
+    nnoremap <buffer> <silent> <CR> :call <SID>TE_ProcessSelection(0)<CR>
+    nnoremap <buffer> <silent> <2-LeftMouse> 
+                                  \ :call <SID>TE_ProcessSelection(0)<CR>
+    nnoremap <buffer> <silent> O :call <SID>TE_ProcessSelection(1)<CR>
+    nnoremap <buffer> <silent> o :call <SID>TE_ListTags()<CR>
+    nnoremap <buffer> <silent> c :silent! foldclose!<CR>
+    nnoremap <buffer> <silent> + :silent! foldopen<CR>
+    nnoremap <buffer> <silent> - :silent! foldclose<CR>
+    nnoremap <buffer> <silent> <kPlus> :silent! foldopen<CR>
+    nnoremap <buffer> <silent> <kMinus> :silent! foldclose<CR>
+    nnoremap <buffer> <silent> u :call <SID>TE_UpdateTags()<CR>
+    nnoremap <buffer> <silent> g :call <SID>TE_ChangeDir()<CR>
+    nnoremap <buffer> <silent> s :call <SID>TE_SortTags()<CR>
+    nnoremap <buffer> <silent> <Space> :call <SID>TE_ShowPrototype()<CR>
+    nnoremap <buffer> <silent> ? :call <SID>TE_ShowHelp()<CR>
+    nnoremap <buffer> <silent> q :close<CR>
+
+    " Highlight the comments, directories, tag types and tag names
+    if has('syntax')
+        syntax match TagExplorerComment '^" .*'
+        highlight clear TagExplorerComment
+        highlight link TagExplorerComment SpecialComment
+
+        syntax match TagExplorerDirectory '^[^"].*/'
+        highlight clear TagExplorerDirectory
+        highlight link TagExplorerDirectory Directory
+
+        syntax match TagExplorerTagType '^  \S*$'
+        highlight clear TagExplorerTagType
+        highlight link TagExplorerTagType Type
+
+        highlight clear TagExplorerTagName
+        highlight link TagExplorerTagName Search
+    endif
+
+    " Folding related settings
+    if has('folding')
+        setlocal foldenable
+        setlocal foldmethod=manual
+        setlocal foldcolumn=3
+        setlocal foldtext=TE_FoldText()
+    endif
+
+    " Define the autocommands
+    augroup TagExplorerAutoCmds
+        autocmd!
+        " Adjust the Vim window width when the tag explorer window is closed
+        autocmd BufUnload __Tag_Explorer__ call <SID>TE_CloseWindow()
+    augroup end
+endfunction
+
+" TE_InitWindow
+" Initialize the tag explorer window. Assumes the focus is already on
+" the tagexplorer window
+function! s:TE_InitWindow()
+    " Clean up all the old variables used for the last directory
+    call s:TE_DeleteStateInfo()
+
+    " Remove the displayed text in the window
+
+    " Mark the buffer as modifiable
+    setlocal modifiable
+
+    " Set report option to a huge value to prevent informational messages
+    " about the deleted lines
+    let old_report = &report
+    set report=99999
+
+    " Delete the contents of the buffer to the black-hole register
+    silent! %delete _
+
+    " Restore the report option
+    let &report = old_report
+
+    " Add comments at the top of the window
+    call append(0, '" Press ? for help')
+    call append(1, '" =' . getcwd())
+    call append(2, '" Tags sorted by ' . g:TE_Sort_Type)
+
+    " Mark the buffer as not modifiable
+    setlocal nomodifiable
+endfunction
+
+" TE_CloseWindow()
+" Close the tag explorer window and adjust the Vim window width
+function! s:TE_CloseWindow()
+    " Remove the autocommands for the tag explorer window
+    silent! autocmd! TagExplorerAutoCmds
+
+    " Reduce the Vim window width, if needed
+    if g:TE_Use_Horiz_Window || g:TE_Adjust_Winwidth == 0 ||
+                \ s:te_winsize_chgd == 0 ||
+                \ &columns < (80 + g:TE_WinWidth)
+        " No need to adjust window width if horizontally split tag explorer
+        " window or if columns is less than 101 or if the user chose not to
+        " adjust the window width
+    else
+        " Adjust the Vim window width
+        let &columns= &columns - (g:TE_WinWidth + 1)
+    endif
+endfunction
+
+" TE_FoldText()
+" Fold expression for the various folds
+function! TE_FoldText()
+    let line = getline(v:foldstart)
+
+    let eighty_spaces = '                    '
+    let eighty_spaces = eighty_spaces . '                    '
+    let eighty_spaces = eighty_spaces . '                    '
+    let eighty_spaces = eighty_spaces . '                    '
+
+    let pat = '\s\{' . strlen(line) . '}'
+    let sub = substitute(eighty_spaces, pat, line, '')
+    return v:folddashes . sub
+endfunction
+
+" TE_ShowHelp()
+" Display the tag explorer help
+function! s:TE_ShowHelp()
+    echo 'Tag Explorer keyboard shortcuts'
+    echo '-------------------------------'
+    echo 'o       : List the tags defined in a file'
+    echo 'c       : Close the tag listing for a file'
+    echo 'u       : Update the tags listed for a file'
+    echo '<Enter> : Jump to the tag definition'
+    echo 'O       : Jump to the tag definition in a new window'
+    echo '<Space> : Display the tag prototype'
+    echo '+       : Open a fold'
+    echo '-       : Close a fold'
+    echo 's       : Sort the tags by order/name'
+    echo 'g       : Goto a directory'
+    echo 'q       : Close the tag explorer window'
 endfunction
 
 " TE_ListDir()
@@ -332,9 +542,6 @@ function! s:TE_ListDir(dirname)
 
     " Store the full path to the current directory
     let s:current_dirname = getcwd()
-
-    " Open or clear the tag explorer window
-    call s:TE_OpenWindow()
 
     " Get a list of all the files in the current directory
     " In the glob() output the last line doesn't end with a \n
@@ -492,254 +699,6 @@ function! s:TE_ListDir(dirname)
     exe s:comments + 1
 
     normal z.
-endfunction
-
-" TE_Cleanup()
-" Delete all variables created for a directory
-function! s:TE_Cleanup()
-    while s:te_file_cnt != 0
-        " For every file listed for the directory, remove all the variables
-        " associated with the file
-        unlet! b:te_{s:te_file_cnt}_name
-        unlet! b:te_{s:te_file_cnt}_start
-        unlet! b:te_{s:te_file_cnt}_end
-
-        " Remove all the variables associated with the different tag types
-        " displayed for the file
-        let var = 'b:te_' . s:te_file_cnt . '_ttype_cnt'
-        if exists(var)
-            let i = 1
-            while i <= b:te_{s:te_file_cnt}_ttype_cnt
-                let ttype = b:te_{s:te_file_cnt}_{i}_name
-                let j = 1
-                " Remove all the tags of this type
-                while j <= b:te_{s:te_file_cnt}_{ttype}_cnt
-                    unlet! b:te_{s:te_file_cnt}_{ttype}_{j}_tag
-                    let j = j + 1
-                endwhile
-
-                unlet! b:te_{s:te_file_cnt}_{ttype}_tagnames
-                unlet! b:te_{s:te_file_cnt}_{ttype}_cnt
-                unlet! b:te_{s:te_file_cnt}_{i}_name
-                unlet! b:te_{s:te_file_cnt}_{i}_start
-                unlet! b:te_{s:te_file_cnt}_{i}_end
-                let i = i + 1
-            endwhile
-            unlet! b:te_{s:te_file_cnt}_ttype_cnt
-        endif
-        let s:te_file_cnt = s:te_file_cnt - 1
-    endwhile
-endfunction
-
-" TE_OpenWindow()
-" Create a new tag explorer window. If it is already open, clear it
-function! s:TE_OpenWindow()
-
-    " Tag explorer window name
-    let bname = '__Tag_Explorer__'
-
-    " Cleanup the tag explorer window, if the window is open
-    let winnum = bufwinnr(bname)
-    if winnum != -1
-        " Jump to the existing window
-        if winnr() != winnum
-            exe winnum . 'wincmd w'
-        endif
-
-        " Mark the buffer as modifiable
-        setlocal modifiable
-
-        " Set report option to a huge value to prevent informational messages
-        " about the deleted lines
-        let old_report = &report
-        set report=99999
-
-        " Delete the contents of the buffer to the black-hole register
-        silent! %delete _
-
-        " Restore the report option
-        let &report = old_report
-
-        " Clean up all the old variables used for the last directory
-        call s:TE_Cleanup()
-    else
-        " Create a new window. If user prefers a horizontal window, then open
-        " a horizontally split window. Otherwise open a vertically split
-        " window
-        if g:TE_Use_Horiz_Window == 1
-            " If a single window is used for all files, then open the tag
-            " explorer window at the very bottom
-            let win_dir = 'botright'
-            " Default horizontal window height is 10
-            let win_width = 10
-        else
-            " Increase the window size, if needed, to accomodate the new
-            " window
-            if g:TE_Adjust_Winwidth == 1 && &columns < (80 + g:TE_WinWidth)
-                " one extra column is needed to include the vertical split
-                let &columns= &columns + (g:TE_WinWidth + 1)
-                let s:te_winsize_chgd = 1
-            else
-                let s:te_winsize_chgd = 0
-            endif
-
-            " Open the window at the leftmost place
-            if g:TE_Use_Right_Window == 1
-                let win_dir = 'botright vertical'
-            else
-                let win_dir = 'topleft vertical'
-            endif
-            let win_width = g:TE_WinWidth
-        endif
-
-        " If the tag explorer temporary buffer already exists, then reuse it.
-        " Otherwise create a new buffer
-        let bufnum = bufnr(bname)
-        if bufnum == -1
-            " Create a new buffer
-            let wcmd = bname
-        else
-            " Edit the existing buffer
-            let wcmd = '+buffer' . bufnum
-        endif
-
-        " Create the tag explorer window
-        exe 'silent! ' . win_dir . ' ' . win_width . 'split ' . wcmd
-
-        " Mark the buffer as a scratch buffer
-        setlocal buftype=nofile
-        setlocal bufhidden=delete
-        setlocal noswapfile
-        setlocal nowrap
-        setlocal buflisted
-        setlocal nonumber
-
-        " Create buffer local mappings for the tag explorer window
-        nnoremap <buffer> <silent> <CR> :call <SID>TE_ProcessSelection(0)<CR>
-        nnoremap <buffer> <silent> <2-LeftMouse> 
-                                      \ :call <SID>TE_ProcessSelection(0)<CR>
-        nnoremap <buffer> <silent> O :call <SID>TE_ProcessSelection(1)<CR>
-        nnoremap <buffer> <silent> o :call <SID>TE_ListTags()<CR>
-        nnoremap <buffer> <silent> c :silent! foldclose!<CR>
-        nnoremap <buffer> <silent> + :silent! foldopen<CR>
-        nnoremap <buffer> <silent> - :silent! foldclose<CR>
-        nnoremap <buffer> <silent> <kPlus> :silent! foldopen<CR>
-        nnoremap <buffer> <silent> <kMinus> :silent! foldclose<CR>
-        nnoremap <buffer> <silent> g :call <SID>TE_ChangeDir()<CR>
-        nnoremap <buffer> <silent> s :call <SID>TE_SortFile()<CR>
-        nnoremap <buffer> <silent> <Space> :call <SID>TE_ShowPrototype()<CR>
-        nnoremap <buffer> <silent> ? :call <SID>TE_ShowHelp()<CR>
-        nnoremap <buffer> <silent> q :close<CR>
-
-    endif
-
-    let s:te_file_cnt = 0
-
-    " Add comments at the top of the window
-    call append(0, '" Press ? for help')
-    call append(1, '" =' . getcwd())
-    call append(2, '" Tags sorted by ' . g:TE_Sort_Type)
-
-    " Mark the buffer as not modifiable
-    setlocal nomodifiable
-
-    " Highlight the comments, directories, tag types and tag names
-    if has('syntax')
-        syntax match TagExplorerComment '^" .*'
-        highlight clear TagExplorerComment
-        highlight link TagExplorerComment SpecialComment
-
-        syntax match TagExplorerDirectory '^[^"].*/'
-        highlight clear TagExplorerDirectory
-        highlight link TagExplorerDirectory Directory
-
-        syntax match TagExplorerTagType '^  \S*$'
-        highlight clear TagExplorerTagType
-        highlight link TagExplorerTagType Type
-
-        highlight clear TagExplorerTagName
-        highlight link TagExplorerTagName Search
-    endif
-
-    " Folding related settings
-    if has('folding')
-        setlocal foldenable
-        setlocal foldmethod=manual
-        setlocal foldcolumn=3
-        setlocal foldtext=TE_FoldText()
-    endif
-
-    " Define the autocommands
-    augroup TagExplorerAutoCmds
-        autocmd!
-        " Adjust the Vim window width when the tag explorer window is closed
-        autocmd BufDelete __Tag_Explorer__ call <SID>TE_CloseWindow()
-    augroup end
-endfunction
-
-" TE_CloseWindow()
-" Close the tag explorer window and adjust the Vim window width
-function! s:TE_CloseWindow()
-    " Remove the autocommands for the tag explorer window
-    silent! autocmd! TagExplorerAutoCmds
-
-    " Reduce the Vim window width, if needed
-    if g:TE_Use_Horiz_Window || g:TE_Adjust_Winwidth == 0 ||
-                \ s:te_winsize_chgd == 0 ||
-                \ &columns < (80 + g:TE_WinWidth)
-        " No need to adjust window width if horizontally split tag explorer
-        " window or if columns is less than 101 or if the user chose not to
-        " adjust the window width
-    else
-        " Adjust the Vim window width
-        let &columns= &columns - (g:TE_WinWidth + 1)
-    endif
-endfunction
-
-" TE_GetFileIndex()
-" Get the file index based on the specified line number
-function! s:TE_GetFileIndex(linenr)
-    " If the line number is less than the first entry, then return
-    if a:linenr < b:te_1_start
-        return 0
-    endif
-
-    " Do a binary search to get the file index
-    let left = 1
-    let right = s:te_file_cnt
-
-    while left < right
-        let middle = (right + left + 1) / 2
-
-        if a:linenr >= b:te_{middle}_start && 
-                                          \ a:linenr <= b:te_{middle}_end
-            return middle
-        endif
-
-        if a:linenr < b:te_{middle}_start
-            let right = middle - 1
-        else
-            let left = middle
-        endif
-    endwhile
-
-    return 0
-endfunction
-
-" TE_GetTtypeIndex()
-" Get the tag type index based on the specified line number
-function! s:TE_GetTtypeIndex(idx, linenr)
-    let i = 1
-
-    " Do a linear search
-    while i <= b:te_{a:idx}_ttype_cnt
-        if a:linenr <= b:te_{a:idx}_start + b:te_{a:idx}_{i}_end
-            return i
-        endif
-        let i = i + 1
-    endwhile
-
-    return 0
 endfunction
 
 " TE_ListTags()
@@ -947,14 +906,96 @@ function! s:TE_ListTags()
     endwhile
 endfunction
 
+" TE_ToggleWindow()
+" Open/Close the tag explorer window
+function! s:TE_ToggleWindow()
+    " Tag explorer buffer name
+    let bname = '__Tag_Explorer__'
+
+    " If tag explorer window is open then close it.
+    let winnum = bufwinnr(bname)
+    if winnum != -1
+        if winnr() == winnum
+            " Already in the tag explorer window. Close it and return
+            close
+        else
+            " Goto the tag explorer window, close it and then come back to the
+            " original window
+            let curbufnr = bufnr('%')
+            exe winnum . 'wincmd w'
+            close
+            " Need to jump back to the original window only if we are not
+            " already in that window
+            let winnum = bufwinnr(curbufnr)
+            if winnr() != winnum
+                exe winnum . 'wincmd w'
+            endif
+        endif
+        return
+    endif
+
+    " Mark the current window as the file window
+    let w:te_file_window = "yes"
+
+    " Open the tag explorer window
+    call s:TE_OpenWindow()
+
+    " Initialize the window
+    call s:TE_InitWindow()
+
+    " List the files in the current directory
+    call s:TE_ListDir(".")
+endfunction
+
+" TE_GetFileIndex()
+" Get the file index based on the specified line number
+function! s:TE_GetFileIndex(linenr)
+    " If the line number is less than the first entry, then return
+    if a:linenr < b:te_1_start
+        return 0
+    endif
+
+    " Do a binary search to get the file index
+    let left = 1
+    let right = s:te_file_cnt
+
+    while left < right
+        let middle = (right + left + 1) / 2
+
+        if a:linenr >= b:te_{middle}_start && 
+                                          \ a:linenr <= b:te_{middle}_end
+            return middle
+        endif
+
+        if a:linenr < b:te_{middle}_start
+            let right = middle - 1
+        else
+            let left = middle
+        endif
+    endwhile
+
+    return 0
+endfunction
+
+" TE_GetTtypeIndex()
+" Get the tag type index based on the specified line number
+function! s:TE_GetTtypeIndex(idx, linenr)
+    let i = 1
+
+    " Do a linear search
+    while i <= b:te_{a:idx}_ttype_cnt
+        if a:linenr <= b:te_{a:idx}_start + b:te_{a:idx}_{i}_end
+            return i
+        endif
+        let i = i + 1
+    endwhile
+
+    return 0
+endfunction
+
 " TE_OpenDir()
 " List the contents of the specified directory
 function! s:TE_OpenDir(newdir)
-    " Remove the previous directory listing
-    setlocal modifiable
-
-    silent! %delete _
-
     " Default is the current directory
     if s:current_dirname == ''
         let s:current_dirname = getcwd()
@@ -987,95 +1028,49 @@ function! s:TE_OpenDir(newdir)
         endif
     endif
 
+    " Initialize the tagexplorer window
+    call s:TE_InitWindow()
+
     " List the directory contents
     call s:TE_ListDir(dirname)
+endfunction
+
+" TE_ChangeDir()
+" Change the directory to the user specified directory and list the contents
+function! s:TE_ChangeDir()
+    let newdir = input("Enter new directory: ")
+    if newdir == ''
+        return
+    endif
+
+    echo "\n"
+
+    " Expand the entered path
+    let newdir = expand(newdir, ":p")
+
+    " Validate the directory
+    if !isdirectory(newdir)
+        let msg = "Error: " . newdir . " is not a valid directory"
+        echohl WarningMsg | echomsg msg | echohl None
+        return
+    endif
+
+    " Default is current directory
+    if s:current_dirname == ''
+        let s:current_dirname = getcwd()
+    endif
+
+    " Save the current directory in the input history, so that this
+    " can be retrieved later
+    call histadd("input", s:current_dirname)
+
+    " Initialize the tag explorer window
+    call s:TE_InitWindow()
+
+    " List the contents of the new directory
+    call s:TE_ListDir(newdir)
 
     setlocal nomodifiable
-endfunction
-
-" TE_JumpToTag
-" Jump to the selected tag
-function! s:TE_JumpToTag(new_window, fidx)
-    let tidx = s:TE_GetTtypeIndex(a:fidx, line('.'))
-    if tidx == 0
-        return
-    endif
-
-    let ttype = b:te_{a:fidx}_{tidx}_name
-    let offset = line('.') - b:te_{a:fidx}_start - 
-                            \ b:te_{a:fidx}_{tidx}_start
-    if offset == 0
-        return
-    endif
-    let mtxt = b:te_{a:fidx}_{ttype}_{offset}_tag
-
-    let start = stridx(mtxt, '/^') + 2
-    let end = strridx(mtxt, '/;"' . "\t")
-    if mtxt[end - 1] == '$'
-        let end = end - 1
-    endif
-    let tagpat = '\V\^' . strpart(mtxt, start, end - start) .
-                                        \ (mtxt[end] == '$' ? '\$' : '')
-
-    let filename = s:current_dirname . '/' . b:te_{a:fidx}_name
-
-    " Highlight the selecte tagname
-    match none
-    exe 'match TagExplorerTagName /\%' . line('.') . 'l\s\+\zs.*/'
-
-    call s:TE_EditFile(a:new_window, filename, tagpat)
-endfunction
-
-" TE_OpenFile
-" Open the selected file
-function! s:TE_OpenFile(new_window, fidx)
-    " Form the full pathname to the file
-    let filename = s:current_dirname . '/' . b:te_{a:fidx}_name
-
-    " Highlight the selecte filename
-    match none
-    exe 'match TagExplorerTagName /\%' . line('.') . 'l.*/'
-
-    " Edit the file
-    call s:TE_EditFile(a:new_window, filename, '')
-endfunction
-
-" TE_ProcessSelection
-" Process a selected entry (directory, file, or tag)
-function! s:TE_ProcessSelection(new_window)
-    let ltxt = getline(".")
-
-    " Skip comment lines
-    if ltxt[0] == '"'
-        return
-    endif
-
-    " If inside a fold, then don't try to open the file
-    if foldclosed('.') != -1
-        return
-    endif
-
-    " If a directory name is selected, list the directory contents
-    if ltxt =~ '.*/'
-        " Remove the forward slash at the end
-        let newdir = strpart(ltxt, 0, strlen(ltxt) - 1)
-
-        call s:TE_OpenDir(newdir)
-    else
-        let fidx = s:TE_GetFileIndex(line('.'))
-        if fidx == 0
-            return
-        endif
-
-        if ltxt =~ '\s'
-            " If a tag is selected jump to the tag
-            call s:TE_JumpToTag(a:new_window, fidx)
-        else
-            " Jump to the selected file
-            call s:TE_OpenFile(a:new_window, fidx)
-
-        endif
-    endif
 endfunction
 
 " TE_EditFile()
@@ -1119,16 +1114,16 @@ function! s:TE_EditFile(new_window, filename, pat)
             " Open a new window
             if g:TE_Use_Horiz_Window == 1
                 exe 'leftabove new ' . a:filename
-                " Go to the tag explorer window to change the window size to the
-                " user configured value
+                " Go to the tag explorer window to change the window size to
+                " the user configured value
                 wincmd p
                 exe 'resize 10'
                 " Go back to the file window
                 wincmd p
             else
                 exe 'rightbelow vnew ' a:filename
-                " Go to the tag explorer window to change the window size to the
-                " user configured value
+                " Go to the tag explorer window to change the window size to
+                " the user configured value
                 wincmd p
                 exe 'vertical resize ' . g:Tlist_WinWidth
                 " Go back to the file window
@@ -1147,9 +1142,56 @@ function! s:TE_EditFile(new_window, filename, pat)
     endif
 endfunction
 
-" TE_SortFile()
-" Change the sort order for a file
-function! s:TE_SortFile()
+" TE_OpenFile
+" Open the selected file
+function! s:TE_OpenFile(new_window, fidx)
+    " Form the full pathname to the file
+    let filename = s:current_dirname . '/' . b:te_{a:fidx}_name
+
+    " Highlight the selecte filename
+    match none
+    exe 'match TagExplorerTagName /\%' . line('.') . 'l.*/'
+
+    " Edit the file
+    call s:TE_EditFile(a:new_window, filename, '')
+endfunction
+
+" TE_JumpToTag
+" Jump to the selected tag
+function! s:TE_JumpToTag(new_window, fidx)
+    let tidx = s:TE_GetTtypeIndex(a:fidx, line('.'))
+    if tidx == 0
+        return
+    endif
+
+    let ttype = b:te_{a:fidx}_{tidx}_name
+    let offset = line('.') - b:te_{a:fidx}_start - 
+                            \ b:te_{a:fidx}_{tidx}_start
+    if offset == 0
+        return
+    endif
+    let mtxt = b:te_{a:fidx}_{ttype}_{offset}_tag
+
+    let start = stridx(mtxt, '/^') + 2
+    let end = strridx(mtxt, '/;"' . "\t")
+    if mtxt[end - 1] == '$'
+        let end = end - 1
+    endif
+    let tagpat = '\V\^' . strpart(mtxt, start, end - start) .
+                                        \ (mtxt[end] == '$' ? '\$' : '')
+
+    let filename = s:current_dirname . '/' . b:te_{a:fidx}_name
+
+    " Highlight the selected tagname
+    match none
+    exe 'match TagExplorerTagName /\%' . line('.') . 'l\s\+\zs.*/'
+
+    call s:TE_EditFile(a:new_window, filename, tagpat)
+endfunction
+
+" TE_ProcessSelection
+" Process a selected entry (directory, file, or tag)
+function! s:TE_ProcessSelection(new_window)
     let ltxt = getline(".")
 
     " Skip comment lines
@@ -1157,23 +1199,48 @@ function! s:TE_SortFile()
         return
     endif
 
-    " Get the file index
-    let fidx = s:TE_GetFileIndex(line('.'))
-    if fidx == 0
+    " If inside a fold, then don't try to open the file
+    if foldclosed('.') != -1
         return
     endif
 
+    " If a directory name is selected, list the directory contents
+    if ltxt =~ '.*/'
+        " Remove the forward slash at the end
+        let newdir = strpart(ltxt, 0, strlen(ltxt) - 1)
+
+        call s:TE_OpenDir(newdir)
+    else
+        let fidx = s:TE_GetFileIndex(line('.'))
+        if fidx == 0
+            return
+        endif
+
+        if ltxt =~ '\s'
+            " If a tag is selected jump to the tag
+            call s:TE_JumpToTag(a:new_window, fidx)
+        else
+            " Jump to the selected file
+            call s:TE_OpenFile(a:new_window, fidx)
+
+        endif
+    endif
+endfunction
+
+" TE_RemoveTags()
+" Remove the tags listed for the specified file.
+function! s:TE_RemoveTags(fidx)
     " Remove the currently listed tags for the selected file.  This will
     " affect the stored starting/ending line numbers for all the files listed
     " below this file. Update all of them.  Change the sort type and recreate
     " the tag listing for the selected file
 
     " Get the starting and ending line numbers for the file
-    let start = b:te_{fidx}_start + 1
-    let end = b:te_{fidx}_end
+    let start = b:te_{a:fidx}_start + 1
+    let end = b:te_{a:fidx}_end
 
     " Goto the filename
-    exe "normal " . b:te_{fidx}_start . "G"
+    exe "normal " . b:te_{a:fidx}_start . "G"
 
     " Mark the buffer as modifiable
     setlocal modifiable
@@ -1194,39 +1261,60 @@ function! s:TE_SortFile()
     setlocal nomodifiable
 
     " Go back to the filename
-    exe "normal " . b:te_{fidx}_start . "G"
+    exe "normal " . b:te_{a:fidx}_start . "G"
 
     " Adjust the end line number for the current file
-    let cnt = b:te_{fidx}_end - b:te_{fidx}_start
-    let b:te_{fidx}_end = b:te_{fidx}_start
+    let cnt = b:te_{a:fidx}_end - b:te_{a:fidx}_start
+    let b:te_{a:fidx}_end = b:te_{a:fidx}_start
 
     " Delete all the variables associated with this file
     let i = 1
-    while i <= b:te_{fidx}_ttype_cnt
-        let ttype = b:te_{fidx}_{i}_name
+    while i <= b:te_{a:fidx}_ttype_cnt
+        let ttype = b:te_{a:fidx}_{i}_name
         let j = 1
-        while j <= b:te_{fidx}_{ttype}_cnt
-            unlet! b:te_{fidx}_{ttype}_{j}_tag
+        while j <= b:te_{a:fidx}_{ttype}_cnt
+            unlet! b:te_{a:fidx}_{ttype}_{j}_tag
             let j = j + 1
         endwhile
 
-        unlet! b:te_{fidx}_{ttype}_tagnames
-        unlet! b:te_{fidx}_{ttype}_cnt
-        unlet! b:te_{fidx}_{i}_name
-        unlet! b:te_{fidx}_{i}_start
-        unlet! b:te_{fidx}_{i}_end
+        unlet! b:te_{a:fidx}_{ttype}_tagnames
+        unlet! b:te_{a:fidx}_{ttype}_cnt
+        unlet! b:te_{a:fidx}_{i}_name
+        unlet! b:te_{a:fidx}_{i}_start
+        unlet! b:te_{a:fidx}_{i}_end
         let i = i + 1
     endwhile
-    unlet! b:te_{fidx}_ttype_cnt
+    unlet! b:te_{a:fidx}_ttype_cnt
 
     " Update the start and end line numbers for all the files listed below
     " this file
-    let i = fidx + 1
+    let i = a:fidx + 1
     while i <= s:te_file_cnt
         let b:te_{i}_start = b:te_{i}_start - cnt
         let b:te_{i}_end = b:te_{i}_end - cnt
         let i = i + 1
     endwhile
+endfunction
+
+" TE_SortTags()
+" Change the sort order for a file
+function! s:TE_SortTags()
+    let ltxt = getline(".")
+
+    " Skip comment lines
+    if ltxt[0] == '"'
+        return
+    endif
+
+    " Get the file index
+    let fidx = s:TE_GetFileIndex(line('.'))
+    if fidx == 0
+        return
+    endif
+
+    " Remove all the tags listed for this file. Also update all the
+    " state information
+    call s:TE_RemoveTags(fidx)
 
     " Toggle the sort order type
     if g:TE_Sort_Type == 'name'
@@ -1245,44 +1333,28 @@ function! s:TE_SortFile()
     call s:TE_ListTags()
 endfunction
 
-" TE_ChangeDir()
-" Change the directory to the user specified directory and list the contents
-function! s:TE_ChangeDir()
-    let newdir = input("Enter new directory: ")
-    if newdir == ''
+" TE_UpdateTags
+" Update/refresh the tags listed for a file
+function! s:TE_UpdateTags()
+    let ltxt = getline(".")
+
+    " Skip comment lines
+    if ltxt[0] == '"'
         return
     endif
 
-    echo "\n"
-
-    " Expand the entered path
-    let newdir = expand(newdir, ":p")
-
-    " Validate the directory
-    if !isdirectory(newdir)
-        let msg = "Error: " . newdir . " is not a valid directory"
-        echohl WarningMsg | echomsg msg | echohl None
+    " Get the file index
+    let fidx = s:TE_GetFileIndex(line('.'))
+    if fidx == 0
         return
     endif
 
-    " Remove the currently listed directory contents
-    setlocal modifiable
+    " Remove all the tags listed for this file. Also update all the
+    " state information
+    call s:TE_RemoveTags(fidx)
 
-    silent! %delete _
-
-    " Default is current directory
-    if s:current_dirname == ''
-        let s:current_dirname = getcwd()
-    endif
-
-    " Save the current directory in the input history, so that this
-    " can be retrieved later
-    call histadd("input", s:current_dirname)
-
-    " List the contents of the new directory
-    call s:TE_ListDir(newdir)
-
-    setlocal nomodifiable
+    " Display the tags defined in the file
+    call s:TE_ListTags()
 endfunction
 
 " TE_ShowPrototype()
@@ -1327,38 +1399,6 @@ function! s:TE_ShowPrototype()
 
     " Display the tag pattern
     echo tag_pat
-endfunction
-
-" TE_FoldText()
-" Fold expression for the various folds
-function! TE_FoldText()
-    let line = getline(v:foldstart)
-
-    let eighty_spaces = '                    '
-    let eighty_spaces = eighty_spaces . '                    '
-    let eighty_spaces = eighty_spaces . '                    '
-    let eighty_spaces = eighty_spaces . '                    '
-
-    let pat = '\s\{' . strlen(line) . '}'
-    let sub = substitute(eighty_spaces, pat, line, '')
-    return v:folddashes . sub
-endfunction
-
-" TE_ShowHelp()
-" Display the tag explorer help
-function! s:TE_ShowHelp()
-    echo 'Tag Explorer keyboard shortcuts'
-    echo '-------------------------------'
-    echo 'o       : List the tags defined in a file'
-    echo 'c       : Close the tag listing for a file'
-    echo '<Enter> : Jump to the tag definition'
-    echo 'O       : Jump to the tag definition in a new window'
-    echo '<Space> : Display the tag prototype'
-    echo '+       : Open a fold'
-    echo '-       : Close a fold'
-    echo 's       : Sort the tags by order/name'
-    echo 'g       : Goto a directory'
-    echo 'q       : Close the tag explorer window'
 endfunction
 
 " Define the command to open/close the tag explorer window
